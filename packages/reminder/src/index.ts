@@ -1,0 +1,1225 @@
+export type ReminderChatRole = "system" | "user" | "assistant";
+
+export interface ReminderChatMessage {
+  role: ReminderChatRole;
+  content: string;
+}
+
+export interface ReminderChatRequest {
+  model?: string;
+  messages: ReminderChatMessage[];
+  temperature?: number;
+  maxTokens?: number;
+  // Reserved for future tool-calling support.
+  tools?: unknown[];
+}
+
+export interface ReminderChatProvider {
+  complete(request: ReminderChatRequest): Promise<string>;
+}
+
+export type ReminderStatus = "pending" | "done" | "archived";
+export type ReminderRecurrence = "none" | "daily" | "weekly" | "monthly";
+
+/** Shared by reminders and tasks for life-area tagging (optional in forms). */
+export type LifeDomain = "health" | "finance" | "career" | "hobby" | "fun";
+
+export interface TaskItem {
+  id: string;
+  title: string;
+  notes?: string;
+  dueAt?: string;
+  status: "pending" | "done";
+  priority?: number;
+  domain?: LifeDomain;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ReminderItem {
+  id: string;
+  title: string;
+  dueAt: string;
+  recurrence?: ReminderRecurrence;
+  notes?: string;
+  priority?: number;
+  urgency?: number;
+  tags?: string[];
+  status: ReminderStatus;
+  createdAt: string;
+  updatedAt: string;
+  /** Present when loaded from dashboard API (owned vs shared invite). */
+  access?: "owner" | "shared";
+  /** Owner’s Clerk id (same as Convex `userId` on the row); set for shared reminders you joined. */
+  ownerUserId?: string;
+  /** When you own the reminder, people who joined via share (for Sent filters). */
+  shareRecipients?: { userId: string; displayName: string }[];
+  /** You shared this reminder with at least one person. */
+  outgoingShared?: boolean;
+  /** Convex task id when this reminder is tied to a task; if absent, treat as ADHOC. */
+  linkedTaskId?: string;
+  domain?: LifeDomain;
+}
+
+export type ReminderIntent =
+  | "list_reminders"
+  | "create_reminder"
+  | "update_reminder"
+  | "decision_query"
+  | "planning_query"
+  | "ambiguous";
+
+export type ReminderBucket = "missed" | "today" | "tomorrow" | "upcoming" | "done";
+
+function dateKey(date: Date, timeZone?: string): string {
+  return date.toLocaleDateString("en-CA", timeZone ? { timeZone } : undefined);
+}
+
+// BUG-3 fix: accepts optional timezone so bucket boundaries use the user's calendar day
+// BUG-fix: date-key check must come BEFORE the `due < now` check so an overdue-today
+// reminder (e.g. daily recurring at 4 AM, now 6 PM same day) lands in "today" — not
+// "missed". This aligns the UI Today tab with the chat's filterToday (both use
+// calendar-day equality, not "is in the future").
+export function getReminderBucket(reminder: ReminderItem, now = new Date(), timeZone?: string): ReminderBucket {
+  if (reminder.status === "done") return "done";
+  const due = new Date(reminder.dueAt);
+  const todayKey = dateKey(now, timeZone);
+  const tomorrowKey = dateKey(new Date(now.getTime() + 86_400_000), timeZone);
+  const dueKey = dateKey(due, timeZone);
+  // Calendar-day equality first — overdue-today still counts as "today" for UI/chat parity
+  if (dueKey === todayKey) return "today";
+  // Now true "missed" = due before today's calendar day, not just "earlier than now"
+  if (due < now) return "missed";
+  if (dueKey === tomorrowKey) return "tomorrow";
+  return "upcoming";
+}
+
+export function buildReminderSnapshot(reminders: ReminderItem[], now = new Date()) {
+  const counts = {
+    pending: 0,
+    done: 0,
+    missed: 0,
+    today: 0,
+    tomorrow: 0,
+  };
+
+  for (const reminder of reminders) {
+    if (reminder.status === "done") {
+      counts.done += 1;
+      continue;
+    }
+
+    counts.pending += 1;
+    const bucket = getReminderBucket(reminder, now);
+    if (bucket === "missed") counts.missed += 1;
+    if (bucket === "today") counts.today += 1;
+    if (bucket === "tomorrow") counts.tomorrow += 1;
+  }
+
+  return counts;
+}
+
+/** How to filter reminders for a natural-language list query */
+export type ReminderListScope =
+  | "missed"
+  | "today"
+  | "tomorrow"
+  /** Strict UI bucket: due after end of tomorrow */
+  | "later"
+  /** Pending with due >= now (colloquial "upcoming", includes today/tomorrow) */
+  | "future"
+  /** All pending (may include missed) */
+  | "all_pending"
+  /** Completed reminders */
+  | "done";
+
+function sortByDueAsc(a: ReminderItem, b: ReminderItem) {
+  return new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime();
+}
+
+// Issue 3 fix: accept timeZone so bucket boundaries (missed/today/tomorrow) use
+// the user's calendar day, not the server's UTC midnight.
+export function filterRemindersByListScope(
+  reminders: ReminderItem[],
+  scope: ReminderListScope,
+  now = new Date(),
+  timeZone?: string
+): ReminderItem[] {
+  const pending = reminders.filter((r) => r.status !== "done");
+  switch (scope) {
+    case "all_pending":
+      return pending.slice().sort(sortByDueAsc);
+    case "future":
+      return pending
+        .filter((r) => new Date(r.dueAt).getTime() >= now.getTime())
+        .sort(sortByDueAsc);
+    case "missed":
+      return pending.filter((r) => getReminderBucket(r, now, timeZone) === "missed").sort(sortByDueAsc);
+    case "today":
+      return pending.filter((r) => getReminderBucket(r, now, timeZone) === "today").sort(sortByDueAsc);
+    case "tomorrow":
+      return pending.filter((r) => getReminderBucket(r, now, timeZone) === "tomorrow").sort(sortByDueAsc);
+    case "later":
+      return pending.filter((r) => getReminderBucket(r, now, timeZone) === "upcoming").sort(sortByDueAsc);
+    case "done":
+      return reminders
+        .filter((r) => r.status === "done")
+        .sort((a, b) => new Date(b.dueAt).getTime() - new Date(a.dueAt).getTime()); // newest first
+    default:
+      return pending.slice().sort(sortByDueAsc);
+  }
+}
+
+// BUG-3 fix: compare calendar-day keys in user's timezone, not server-local midnight
+export function filterToday(reminders: ReminderItem[], now = new Date(), timeZone?: string): ReminderItem[] {
+  const todayKey = dateKey(now, timeZone);
+  return reminders
+    .filter((r) => {
+      if (r.status === "done" || r.status === "archived") return false;
+      return dateKey(new Date(r.dueAt), timeZone) === todayKey;
+    })
+    .sort(sortByDueAsc);
+}
+
+export function getTodayReminders(reminders: ReminderItem[], now = new Date(), timeZone?: string): ReminderItem[] {
+  return filterToday(reminders, now, timeZone);
+}
+
+function reminderPriority(reminder: ReminderItem): number {
+  if (typeof reminder.priority === "number" && Number.isFinite(reminder.priority)) return reminder.priority;
+  return 0;
+}
+
+function reminderUrgency(reminder: ReminderItem): number {
+  if (typeof reminder.urgency === "number" && Number.isFinite(reminder.urgency)) return reminder.urgency;
+  return 0;
+}
+
+export function rankTasks(reminders: ReminderItem[], now = new Date()): ReminderItem[] {
+  const active = reminders.filter((r) => r.status !== "done" && r.status !== "archived");
+  return active.slice().sort((a, b) => {
+    const aOverdue = new Date(a.dueAt).getTime() < now.getTime() ? 1 : 0;
+    const bOverdue = new Date(b.dueAt).getTime() < now.getTime() ? 1 : 0;
+    if (aOverdue !== bOverdue) return bOverdue - aOverdue;
+
+    const byDue = new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime();
+    if (byDue !== 0) return byDue;
+
+    const byUrgency = reminderUrgency(b) - reminderUrgency(a);
+    if (byUrgency !== 0) return byUrgency;
+
+    return reminderPriority(b) - reminderPriority(a);
+  });
+}
+
+export interface ScheduleConflict {
+  first: ReminderItem;
+  second: ReminderItem;
+  minutesApart: number;
+}
+
+export interface ScheduleAnalysis {
+  nextTask: ReminderItem | null;
+  overdueTasks: ReminderItem[];
+  upcomingTasks: ReminderItem[];
+  conflicts: ScheduleConflict[];
+  freeSlots: string[];
+}
+
+// BUG-4 fix: accepts display options so free-slot times use the user's timezone
+export function analyzeSchedule(reminders: ReminderItem[], now = new Date(), options?: ReminderDisplayOptions): ScheduleAnalysis {
+  const ranked = rankTasks(reminders, now);
+  const overdueTasks = ranked.filter((r) => new Date(r.dueAt).getTime() < now.getTime()).slice(0, 5);
+  const upcomingTasks = ranked.filter((r) => new Date(r.dueAt).getTime() >= now.getTime()).slice(0, 5);
+  const nextTask = upcomingTasks[0] ?? overdueTasks[0] ?? null;
+
+  const sortedByDue = reminders
+    .filter((r) => r.status !== "done" && r.status !== "archived")
+    .slice()
+    .sort(sortByDueAsc);
+  const conflicts: ScheduleConflict[] = [];
+  for (let i = 0; i < sortedByDue.length - 1; i += 1) {
+    const first = sortedByDue[i];
+    const second = sortedByDue[i + 1];
+    if (!first || !second) continue;
+    const minutesApart = Math.round(
+      (new Date(second.dueAt).getTime() - new Date(first.dueAt).getTime()) / 60000
+    );
+    if (minutesApart >= 0 && minutesApart <= 30) {
+      conflicts.push({ first, second, minutesApart });
+    }
+  }
+
+  const tzOpts = options?.timeZone ? { timeZone: options.timeZone } : undefined;
+  const freeSlots: string[] = [];
+  for (let i = 0; i < sortedByDue.length - 1 && freeSlots.length < 3; i += 1) {
+    const current = sortedByDue[i];
+    const next = sortedByDue[i + 1];
+    if (!current || !next) continue;
+    const currentDue = new Date(current.dueAt);
+    const nextDue = new Date(next.dueAt);
+    const gapMinutes = Math.round((nextDue.getTime() - currentDue.getTime()) / 60000);
+    if (gapMinutes >= 90) {
+      const start = new Date(currentDue.getTime() + 30 * 60 * 1000);
+      freeSlots.push(
+        `${start.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...tzOpts })} to ${nextDue.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", ...tzOpts })}`
+      );
+    }
+  }
+
+  return { nextTask, overdueTasks, upcomingTasks, conflicts, freeSlots };
+}
+
+// FLAW-1 fix: remove over-broad last condition that matched queries about existing reminders
+export function looksLikeCreateIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  // Exclude lookup / list queries about existing reminders
+  if (/^(did i|have i|do i|does|is there|was there)\b/.test(n)) return false;
+  if (/^(show|list|what|which|tell me|give me|find)\b/.test(n)) return false;
+  if (/\b(already\s+(set|have|created|scheduled)|check if|look up)\s+a?\s*reminder\b/.test(n)) return false;
+  // Original patterns
+  if (/\bremind me to\b/.test(n)) return true;
+  // "remind me <in 2 hours / on monday / at 5 / tomorrow> to|about <action>" — the
+  // time/date sits BETWEEN "remind me" and "to", so the contiguous check above
+  // misses it. This is the grammar of a reminder, not an enumerated phrase.
+  if (/\bremind me\b[\s\S]{0,40}?\b(to|about|that)\b/.test(n)) return true;
+  // "make sure i remember/remind … to …", "make sure i call john tonight"
+  if (/\bmake sure (?:i|that i)\s+(?:remember|remind|don'?t forget)\b/.test(n)) return true;
+  // "note this down", "note: …", "jot down …", "make a note …"
+  if (/\bnote (?:this|that|it)? ?down\b/.test(n)) return true;
+  if (/^note\s*[:\-—]/.test(n)) return true;
+  if (/\bjot (?:this|that|it)? ?down\b/.test(n)) return true;
+  if (/\bmake a note\b/.test(n)) return true;
+  if (/\b(create|add|set|make|schedule)\s+(a\s+|an\s+|the\s+|my\s+)?reminder\b/.test(n)) return true;
+  // "create a meeting reminder" / "add gym reminder" — modifier word between article and "reminder"
+  if (/\b(create|add|set|make|schedule)\s+(a\s+|an\s+|the\s+|my\s+)?(?:new\s+)?\w+\s+reminder\b/.test(n)) return true;
+  if (/\b(schedule|set)\s+(a\s+)?(task|meeting|event|appointment|call)\b/.test(n)) return true;
+  if (/\b(add|create)\s+to\s+(my\s+)?(calendar|reminders)\b/.test(n)) return true;
+  // Extended patterns
+  if (/\bdon'?t\s+forget\s+to\b/.test(n)) return true;
+  if (/\bi\s+(need|must|have|should|want)\s+to\s+remember\s+to\b/.test(n)) return true;
+  if (/\bremind\s+myself\s+(to|about)\b/.test(n)) return true;
+  if (/\b(can|could|please)\s+(you\s+)?remind\s+me\s+(to|about)\b/.test(n)) return true;
+  if (/\bping\s+me\s+(at|about|for|when)\b/.test(n)) return true;
+  if (/\b(alert|notify)\s+me\s+(at|about|for|when|to)\b/.test(n)) return true;
+  if (/\bput\s+(a\s+)?reminder\s+(for|to|about)\b/.test(n)) return true;
+  // Issue 9 fix: natural-language implicit create patterns
+  // "I need to go to gym tomorrow at 7am" / "Going to gym tomorrow"
+  if (/\bi\s+(need|must|have|got|gotta)\s+to\b.{0,60}\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|at \d|tonight|morning|evening|afternoon)\b/.test(n)) return true;
+  // "Going to the dentist on Friday at 3pm"
+  if (/^going\s+to\b/.test(n) && /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|at \d|tonight|morning|evening|afternoon)\b/.test(n)) return true;
+  // "Taking a flight on Thursday"
+  if (/^(taking|meeting|calling|visiting|attending|catching)\b.{0,60}\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|at \d|tonight|morning|evening|afternoon)\b/.test(n)) return true;
+  // "I have a meeting today at 10pm" / "today at 10pm I have a meeting"
+  if (
+    /\bi\s+have\s+(a\s+|an\s+)?(meeting|appointment|call|session|standup|class|event|interview|review|dinner|lunch|flight|game|practice|exam)\b/.test(n) &&
+    (/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(n) || /\bat\s+\d/.test(n))
+  ) return true;
+  // Hindi / Marathi
+  if (/\b(याद\s+दिलाना|याद\s+कराना|याद\s+रखना|रिमाइंडर\s+लगाओ)\b/.test(n)) return true;
+  return false;
+}
+
+/**
+ * Detects NATURAL reminder phrasings that don't use an explicit trigger word
+ * ("remind me" / "set a reminder"). Real users type "gym tomorrow 6am", "call
+ * dentist at 3pm", "team meeting monday 10am", "pay rent on the 20th" — and
+ * expect a reminder. The signal: an actionable message carrying a concrete
+ * date / time / recurrence cue, that is NOT a question, a list/lookup, or a
+ * mutation of an existing reminder.
+ *
+ * Bias is intentionally toward creating: in a reminder app a missed create is a
+ * worse failure than an extra card the user can dismiss. Genuinely ambiguous
+ * messages (no date cue at all) are left for the LLM path.
+ */
+export function looksLikeImplicitCreate(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  if (n.length < 3) return false;
+
+  // Questions / lookups / lists are never a create.
+  if (/^(did|have|do|does|is|are|was|were|can|could|would|will|should|when|where|why|how|what|which|who|show|list|tell me|give me|find|search|look up|any)\b/.test(n)) return false;
+  if (/\?\s*$/.test(n)) return false;
+
+  // Conversational / past-tense openers are not reminders.
+  if (/^(i had|i went|i was|i did|we had|we went|it was|that was|thanks|thank you|hi|hello|hey|yo|good (morning|night|evening|afternoon)|lol|haha|ok|okay|yes|no|sure)\b/.test(n)) return false;
+
+  // Never hijack a mutation of an existing reminder.
+  if (
+    looksLikeRescheduleIntent(message) ||
+    looksLikeEditIntent(message) ||
+    looksLikeDeleteIntent(message) ||
+    looksLikeMarkDoneIntent(message) ||
+    looksLikeSnoozeIntent(message) ||
+    looksLikeBulkIntent(message)
+  ) return false;
+
+  // Require a concrete date / time / recurrence cue.
+  const hasClockTime = /\b(\d{1,2}\s*:\s*\d{2}|\d{1,2}\s*(a\.?m\.?|p\.?m\.?)|at\s+\d{1,2}\b|noon|midnight|o'?clock)\b/.test(n);
+  const hasRelativeDay = /\b(today|tonight|tomorrow|tomorow|tommarow|tmrw|day after tomorrow|this\s+(morning|afternoon|evening|week|weekend)|next\s+(week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b/.test(n);
+  const hasWeekday = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)\b/.test(n);
+  const hasMonthDay =
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\.?\s+\d{1,2}\b/.test(n) ||
+    /\b\d{1,2}(st|nd|rd|th)\b/.test(n) ||
+    /\b\d{1,2}[\/\-]\d{1,2}\b/.test(n) ||
+    /\bon\s+the\s+\d{1,2}\b/.test(n);
+  const hasRecurrence = /\b(daily|weekly|monthly|everyday)\b|\b(every|each)\s+\w+/.test(n);
+  // Time-of-day words count as a time cue ("remind me in the afternoon for yoga",
+  // "call mom by evening") — these resolve to a concrete hour downstream.
+  const hasTimeOfDay = /\b(this\s+|in\s+the\s+|by\s+)?(morning|afternoon|evening|night|tonight)\b/.test(n);
+
+  return hasClockTime || hasRelativeDay || hasWeekday || hasMonthDay || hasRecurrence || hasTimeOfDay;
+}
+
+export function looksLikeBulkIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  // Requires explicit "all / every / each" scope word
+  if (!/\b(all|every|each)\b/.test(n)) return false;
+  // Must pair with a mutation operation
+  if (/\b(delete|remove|cancel|dismiss|trash|erase)\b/.test(n)) return true;
+  if (/\b(mark|set|flag)\b.{0,25}\b(done|complete|completed|finished)\b/.test(n)) return true;
+  if (/\b(complete|finish)\b/.test(n)) return true;
+  return false;
+}
+
+export function looksLikeEditIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  // Hard-block: question starters that are never edits
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  // Hard-block: creation/addition openers — "create a high priority reminder", "set a daily reminder"
+  if (/^(remind\s+me|create|add|new\s+(reminder|task)|schedule|make\s+a|set\s+a|set\s+up)\b/.test(n)) return false;
+  // title / notes
+  if (/\b(rename|retitle)\b/.test(n)) return true;
+  if (/\b(change|update|edit|modify)\b.{0,35}\b(title|name|notes?|description)\b/.test(n)) return true;
+  if (/\b(add|set)\s+(notes?|description)\s+(for|to|on)\b/.test(n)) return true;
+  // priority — require an existing-item context (the|my|its|reminder) before priority keyword
+  if (/\b(set|change|update|make)\b.{0,30}\b(the|my|its|reminder)\b.{0,30}\bpriority\b/.test(n)) return true;
+  if (/\bpriority\b.{0,30}\b(of|for|on)\b.{0,30}\b(the|my)\b/.test(n)) return true;
+  if (/\bpriority\b.{0,25}\b(to|as)\b.{0,20}\b(high|medium|low|urgent|normal|\d)\b/.test(n)) return true;
+  // domain
+  if (/\b(set|change|update)\b.{0,30}\b(the|my|its)\b.{0,20}\b(domain|category)\b/.test(n)) return true;
+  if (/\b(domain|category)\b.{0,25}\b(to|as)\b/.test(n)) return true;
+  // recurrence — require an existing-item context
+  if (/\b(make|set|change|update)\b.{0,25}\b(the|my|its)\b.{0,30}\b(daily|weekly|monthly|recurring|recurrence|one.?time|non.?recurring)\b/.test(n)) return true;
+  if (/\b(recurrence|recurring)\b.{0,25}\b(to|as)\b/.test(n)) return true;
+  if (/\bstop\s+(repeating|recurring)\b/.test(n)) return true;
+  // task link / delink
+  if (/\b(link|attach|connect)\b.{0,30}\b(the|my|this)\b.{0,30}\b(reminder|it)\b.{0,30}\b(to|with)\b.{0,30}\btask\b/.test(n)) return true;
+  if (/\b(link|attach|connect)\b.{0,15}\b(reminder|it)\b/.test(n) && /\btask\b/.test(n)) return true;
+  if (/\b(unlink|delink|detach|disconnect)\b.{0,30}\b(task|from|reminder)\b/.test(n)) return true;
+  if (/\bremove\b.{0,20}\btask\b.{0,20}\b(link|connection|association)\b/.test(n)) return true;
+  return false;
+}
+
+export function looksLikeSnoozeIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  if (/\bsnooze\b/.test(n)) return true;
+  if (/\b(remind me again|remind me later)\b/.test(n)) return true;
+  if (/\b(push|delay|postpone)\b.{0,25}\b(by|for)\s+\d/.test(n)) return true;
+  // Broadened natural phrasings ("push it back", "bump that out", "give me more time").
+  if (/\b(push|bump|kick)\s+(it|that|this)\s+(back|out|later)\b/.test(n)) return true;
+  if (/\bgive me (a bit |some )?more time\b/.test(n)) return true;
+  if (/\bnot (ready|now)\b.{0,20}\b(later|tomorrow|remind)\b/.test(n)) return true;
+  return false;
+}
+
+export function looksLikeMarkDoneIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  // Guard: questions about done status, not commands to mark done
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  if (/\b(already\s+(done|complete)|check if|look up)\b/.test(n)) return false;
+  // Explicit mark-done commands
+  if (/\b(mark|set|flag)\b.{0,40}\b(done|complete|completed|finished)\b/i.test(n)) return true;
+  if (/\bdone\s+with\b/i.test(n)) return true;
+  // Fix: only match imperative-start "complete/finish <reminder>" — not mid-sentence uses like "I need to finish the project"
+  if (/^(complete|finish|finished)\s+(?:the\s+|my\s+)?(?:reminder\s+(?:for\s+)?)?(\w)/i.test(n)) return true;
+  if (/\bi('?ve| have)\s+(done|completed|finished)\b/i.test(n)) return true;
+  if (/\bcheck\s*(ed)?\s*off\b/i.test(n)) return true;
+  // Broadened natural phrasings ("ticked off gym", "knocked it out", "i did the
+  // dishes", "gym is done", "got the report done"). Guarded so questions
+  // ("is the gym done?") and future intent ("i need to finish X") don't match.
+  if (/\b(tick|cross)\s*(ed|ing)?\s*off\b/i.test(n)) return true;
+  if (/\bknocked\s+(it|that|them)\s+out\b/i.test(n)) return true;
+  if (/\bi\s+(just\s+)?(did|finished|completed)\s+(?:the\s+|my\s+)?\w/i.test(n)) return true;
+  if (/\bgot\s+(?:it|that|the\s+\w+|my\s+\w+)\s+done\b/i.test(n)) return true;
+  if (
+    !/^(is|are|was|were|do|does|did|has|have|can|could|will|would|should)\b/.test(n) &&
+    /\b(is|are)\s+(done|complete|completed|finished)\b/.test(n)
+  ) return true;
+  return false;
+}
+
+export function looksLikeDeleteIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  // Guard: questions about deleted items, not commands to delete
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  if (/\b(already\s+deleted|check if|look up)\b/.test(n)) return false;
+  // Explicit delete commands
+  if (/\b(delete|remove|cancel|dismiss|drop|trash|erase)\s+(?:the\s+|my\s+|this\s+|that\s+)?(?:reminder\s+(?:for\s+)?)?(\w)/i.test(n)) return true;
+  // Broadened natural phrasings ("get rid of the dentist one", "scrap that",
+  // "take gym off my list", "clear the meeting reminder").
+  if (/\bget(?:ting)?\s+rid\s+of\b/i.test(n)) return true;
+  if (/\b(scrap|wipe|clear)\s+(?:the\s+|my\s+|this\s+|that\s+)?(?:reminder\s+(?:for\s+)?)?\w/i.test(n)) return true;
+  if (/\btake\s+(?:the\s+|my\s+)?.{0,30}\boff\s+(?:my\s+)?(?:list|reminders?)\b/i.test(n)) return true;
+  return false;
+}
+
+export function looksLikeRescheduleIntent(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  // Guard: questions not commands
+  if (/^(did i|have i|do i|does|is there|was there|what|which|show|list|how many)\b/.test(n)) return false;
+  // Explicit reschedule keyword
+  if (/\breschedule\b/.test(n)) return true;
+  // "change/update/set the time/date of X" — covers "change the time of playing to 5pm"
+  if (/\b(change|update|set)\s+the\s+(time|date|due\s+date|due\s+time|schedule)\b/.test(n)) return true;
+  // "change/update time of X to Y"
+  if (/\b(change|update)\b.{0,40}\btime\b.{0,30}\b(to|of|for)\b/.test(n)) return true;
+  // "change/update X date to Y" — "change Hupendra work date to 18 May 1PM"
+  if (/\b(change|update)\b.{0,50}\bdate\b.{0,30}\bto\b/.test(n)) return true;
+  // "move X to [date/time]" — "move meeting to tomorrow 3pm"
+  if (
+    /\bmove\b.{0,60}\b(to|from)\b/.test(n) &&
+    /\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|morning|evening|afternoon|at\s+\d)\b/.test(n)
+  ) return true;
+  // "shift X to [date/time]"
+  if (/\bshift\b.{0,60}\b(to|from)\b/.test(n) && /\b(today|tomorrow|tonight|at\s+\d)\b/.test(n)) return true;
+  // "set X for [new time]" — only when a reminder is targeted (not "set a reminder")
+  if (/\bset\s+it\s+(for|to)\b/.test(n)) return true;
+  // "change/move/push X to <time>" — the most common phrasing, with NO literal
+  // "time"/"date" word ("change my doctor reminder to 3pm", "move gym to friday").
+  // Requires a time-like token after "to" so it isn't confused with a title edit.
+  if (
+    /\b(change|update|move|shift|push|reschedule|set)\b.{0,50}\bto\b/.test(n) &&
+    /\b(\d{1,2}\s*:\s*\d{2}|\d{1,2}\s*(am|pm)|o'?clock|noon|midnight|today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next\s+\w+|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/.test(n)
+  ) return true;
+  return false;
+}
+
+export function classifyReminderIntent(message: string): ReminderIntent {
+  const n = message.toLowerCase().trim();
+  if (!n) return "ambiguous";
+  if (looksLikeCreateIntent(message)) {
+    return "create_reminder";
+  }
+  if (/\b(update|edit|change|move|reschedule|complete|done|mark|delete|remove|archive)\b/.test(n)) {
+    return "update_reminder";
+  }
+  if (/\b(what should i do right now|what should i do next|what next|next best|top priority|prioritize)\b/.test(n)) {
+    return "decision_query";
+  }
+  if (/\b(plan|planning|schedule my day|organize my day|how should i plan)\b/.test(n)) {
+    return "planning_query";
+  }
+  // Direct list cues — unambiguously about reminders.
+  if (/\b(reminders?|due\s+today|due\s+tomorrow|upcoming|overdue|pending|scheduled)\b/.test(n)) {
+    return "list_reminders";
+  }
+  // Generic interrogatives ("what / which / show / give me / list / anything") only
+  // count as a list query when paired with a reminder/time cue — so non-reminder
+  // chat like "what's the weather like" isn't mislabeled as a reminder list.
+  if (
+    /\b(list|show|which|what|give me|anything)\b/.test(n) &&
+    /\b(today|tomorrow|tonight|this\s+week|week|weekend|missed|left|to\s*do|todo|on my (list|plate|agenda)|do i have)\b/.test(n)
+  ) {
+    return "list_reminders";
+  }
+  return "ambiguous";
+}
+
+/** When set (e.g. IANA `Asia/Kolkata`), due times format in the user's zone — required on servers whose default is UTC. */
+export type ReminderDisplayOptions = {
+  timeZone?: string;
+  /** Convex task id → title for linked reminders (digest copy). */
+  taskTitleById?: Record<string, string>;
+};
+
+/** True when the reminder is not attached to any task (system label: ADHOC). */
+export function isAdhocReminder(reminder: ReminderItem): boolean {
+  return !reminder.linkedTaskId;
+}
+
+function dueTimeLocaleOptions(options?: ReminderDisplayOptions): Intl.DateTimeFormatOptions {
+  return {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    ...(options?.timeZone ? { timeZone: options.timeZone } : {}),
+  };
+}
+
+function overdueLabel(dueAt: string, now: Date): string {
+  const diff = now.getTime() - new Date(dueAt).getTime();
+  const days = Math.floor(diff / 86_400_000);
+  const hours = Math.floor(diff / 3_600_000);
+  if (days >= 1) return `overdue ${days}d`;
+  if (hours >= 1) return `overdue ${hours}h`;
+  return "overdue";
+}
+
+// MISSING-5 fix: overdue items now show how long they've been overdue (e.g. "overdue 3d")
+export function describeReminderForChat(
+  reminder: ReminderItem,
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string {
+  const due = new Date(reminder.dueAt);
+  const when = due.toLocaleString(undefined, dueTimeLocaleOptions(options));
+  const bucket = getReminderBucket(reminder, now, options?.timeZone);
+  const bucketLabel =
+    bucket === "missed"
+      ? overdueLabel(reminder.dueAt, now)
+      : bucket === "today"
+        ? "today"
+        : bucket === "tomorrow"
+          ? "tomorrow"
+          : bucket === "upcoming"
+            ? "later"
+            : "";
+
+  // Title fallback: some reminders were created without a real title and stored
+  // as the generic "Reminder". Show a cleaned first line of their notes instead,
+  // so the user sees something meaningful rather than a bare "Reminder".
+  const rawTitle = reminder.title.trim();
+  const notesUsedAsTitle = rawTitle.toLowerCase() === "reminder" && !!reminder.notes?.trim();
+  const displayTitle = notesUsedAsTitle ? cleanNotesText(reminder.notes!, 60) : rawTitle;
+
+  let line = `${displayTitle} — ${when}`;
+  if (bucketLabel) line += ` (${bucketLabel})`;
+  if (reminder.domain) {
+    line += ` · ${reminder.domain}`;
+  }
+  if (isAdhocReminder(reminder)) {
+    // Adhoc = no linked task — omit the task label entirely in user-facing output
+    // (the internal context block adds "| id=..." separately for LLM use)
+  } else {
+    const tid = reminder.linkedTaskId!;
+    const tname = options?.taskTitleById?.[tid];
+    // If the task name is not found in the lookup map, fall back to a clean label
+    // rather than leaking the raw Convex ID to the user.
+    line += tname ? ` · task: ${tname}` : ` · task: (linked)`;
+  }
+  if (reminder.recurrence && reminder.recurrence !== "none") {
+    line += `. Repeats ${reminder.recurrence}`;
+  }
+  // Notes: collapse newlines so multi-line / numbered-list notes don't get
+  // re-rendered as a broken nested list in the chat (the "1,2,3,2,3" bug).
+  // Skip when the notes are already serving as the display title.
+  if (reminder.notes?.trim() && !notesUsedAsTitle) {
+    line += `. Notes: ${cleanNotesText(reminder.notes, 140)}`;
+  }
+  return line;
+}
+
+/**
+ * Flatten reminder notes for inline chat display: collapse all whitespace/newlines
+ * to single spaces (so a multi-line numbered list never renders as markdown list
+ * items), trim, and truncate to `maxLen` characters.
+ */
+function cleanNotesText(notes: string, maxLen: number): string {
+  const flat = notes.replace(/\s+/g, " ").trim();
+  return flat.length > maxLen ? `${flat.slice(0, maxLen).trimEnd()}…` : flat;
+}
+
+export function buildListRemindersReply(
+  reminders: ReminderItem[],
+  scope: ReminderListScope,
+  now = new Date(),
+  limit = 5,
+  options?: ReminderDisplayOptions
+): string {
+  // Issue 3 / Issue 10 fix: forward timeZone so bucket boundaries are evaluated in the user's calendar day
+  const filtered = filterRemindersByListScope(reminders, scope, now, options?.timeZone).slice(0, Math.max(1, limit));
+  if (filtered.length === 0) {
+    const scopeHint =
+      scope === "future"
+        ? "nothing scheduled ahead"
+        : scope === "all_pending"
+          ? "no pending reminders"
+          : scope === "missed"
+            ? "no overdue reminders"
+            : `no reminders in this view (${scope})`;
+    return `You have ${scopeHint}.`;
+  }
+
+  const header =
+    filtered.length === 1
+      ? "Here is your reminder:"
+      : `Here are your top ${filtered.length} reminders:`;
+  const lines = filtered.map((r, i) => `${i + 1}. ${describeReminderForChat(r, now, options)}`);
+  return [header, ...lines].join("\n");
+}
+
+/**
+ * Map a user message to a list scope, or null if this is not a list/summary query.
+ * Colloquial "upcoming" maps to `future` (due >= now), not the strict "later" bucket.
+ */
+export function inferListScopeFromMessage(message: string): ReminderListScope | null {
+  const n = message.toLowerCase().trim();
+  if (classifyReminderIntent(message) === "decision_query") return null;
+  if (looksLikeCreateIntent(message)) return null;
+
+  // M2 fix: topic-qualified queries ("related to X", "about the X", "health reminders") must go
+  // to LLM, not return a generic time-bucket list — the user is searching by topic, not by time.
+  if (/\brelated\s+to\b/.test(n)) return null;
+  if (
+    /\breminders?\s+(about|for|on|regarding)\s+\w/.test(n)
+    && !/\b(today|tonight|tomorrow|overdue|missed|upcoming|all|pending|done)\b/.test(n)
+  ) return null;
+  if (
+    /\b(about|regarding)\s+(the\s+|a\s+|an\s+)?\w/.test(n)
+    && /\breminders?\b/.test(n)
+    && !/\b(today|tonight|tomorrow|overdue|missed|upcoming|all|pending|done)\b/.test(n)
+  ) return null;
+  // M2 fix (extended): domain keyword BEFORE "reminders" also routes to LLM
+  // e.g. "show me health reminders", "list finance reminders", "my gym reminders"
+  if (
+    /\b(health|fitness|gym|finance|financial|money|career|work|job|hobby|hobbies|fun|entertainment|study|coding|personal)\b/.test(n)
+    && /\breminders?\b/.test(n)
+    && !/\b(today|tonight|tomorrow|overdue|missed|upcoming|all|pending|done)\b/.test(n)
+  ) return null;
+
+  // Detail-style questions are handled elsewhere, not as a bulk list
+  if (/\bwhat'?s that\b/.test(n)) return null;
+  if (/\bwhat time\b/.test(n)) return null;
+  if (/\b(which|what) (one|reminder)\b/.test(n) && !/\b(list|show|all|my upcoming|many)\b/.test(n)) {
+    return null;
+  }
+
+  // "overdue"/"missed" → missed list. Don't require the literal word "reminder":
+  // in a reminder app, "what's overdue" / "anything missed" obviously mean reminders.
+  if (
+    /\b(overdue|missed)\b/.test(n) &&
+    (/\b(reminder|reminders|due|scheduled)\b/.test(n) ||
+      /\b(what|whats|what'?s|anything|any|show|list|see|view|got)\b/.test(n))
+  ) return "missed";
+  // Done/completed reminders — must be checked before the generic "tomorrow" path
+  if (
+    /\b(done|completed?|finished|checked\s*off|marked\s*done)\b/.test(n)
+    && /\b(reminder|reminders)\b/.test(n)
+  ) return "done";
+  const queryCue = /\b(what|whats|what'?s|anything|any|show|list|see|view|got|have|do i)\b/.test(n);
+  if (/\btomorrow\b/.test(n) && (/\b(reminder|reminders|due|scheduled)\b/.test(n) || queryCue)) return "tomorrow";
+  if (
+    /\b(today|tonight)\b/.test(n)
+    && (/\b(reminder|reminders|due|scheduled)\b/.test(n) || queryCue)
+    && !/\bupcoming\b/.test(n)
+  ) {
+    return "today";
+  }
+
+  if (
+    /\b(later|after tomorrow|past tomorrow|next week|upcoming week)\b/.test(n)
+    && /\b(reminder|reminders)\b/.test(n)
+    && !/\bupcoming\b/.test(n)
+  ) {
+    return "later";
+  }
+
+  if (
+    /\b(upcoming|coming up|ahead|scheduled next|what'?s next|what do i have (coming|next))\b/.test(n)
+    && (/\b(reminder|reminders|appointment|meeting|call)\b/i.test(n) ||
+      /\b(what|whats|what'?s|anything|any|show|list|see|view|got)\b/.test(n))
+  ) {
+    return "future";
+  }
+
+  // Bare "all/everything (my) reminders" — common query with no list verb.
+  if (
+    /\b(all|every|everything)\b/.test(n)
+    && /\breminders?\b/.test(n)
+    && !/\b(today|tonight|tomorrow|overdue|missed|done|completed|later)\b/.test(n)
+  ) return "all_pending";
+
+  if (
+    /\b(what|which|show|list|tell me|give me|how many)\b/.test(n)
+    && /\breminders?\b/.test(n)
+  ) {
+    if (/\b(all|everything|full)\b/.test(n)) return "all_pending";
+    if (/\b(today|tonight)\b/.test(n)) return "today";
+    if (/\btomorrow\b/.test(n)) return "tomorrow";
+    if (/\b(missed|overdue)\b/.test(n)) return "missed";
+    if (/\b(done|completed?|finished|checked\s*off)\b/.test(n)) return "done";
+    if (/\b(later|after tomorrow)\b/.test(n)) return "later";
+    // Default for a generic "show/list/how many reminders" → ALL pending,
+    // sorted oldest-due-first. Using "future" here silently hid overdue
+    // reminders and reported "nothing scheduled ahead" for users whose
+    // reminders are all overdue. Explicit "upcoming/next/ahead" still maps to
+    // "future" via the dedicated branch above.
+    return "all_pending";
+  }
+
+  return null;
+}
+
+export function inferDetailQueryAboutReminders(message: string): boolean {
+  const n = message.toLowerCase().trim();
+  if (inferListScopeFromMessage(message)) return false;
+  if (/\b(what|which)\s+reminders?\b/.test(n)) return false;
+  // Guard: behavioral/insight questions are not detail lookups
+  if (/\b(keep|pattern|rate|often|usually|always|never|tend to|history|track)\b/.test(n)) return false;
+
+  if (/\b(what'?s that|which one|which reminder|what reminder|more detail)\b/.test(n)) return true;
+  // "tell me about X" — works even without "reminder" keyword (e.g. "tell me about hupendra work")
+  if (/\b(tell me (more )?about|details (on|about|for))\b/.test(n)) return true;
+  if (/\bwhat time\b/.test(n) && /\b(for|is|was|about|call|meeting|reminder)\b/.test(n)) return true;
+  if (
+    /\b(about my reminder|my reminder|describe)\b/.test(n)
+    && /\b(reminder|call|meeting)\b/.test(n)
+  ) {
+    return true;
+  }
+  // "show me the X reminder", "what is the X task", "info on X"
+  if (/\b(show me|give me|info on|information (on|about)|details? (of|for|on))\b/.test(n)) return true;
+  // "what's the X reminder" — typo tolerant because fuzzy matching is used downstream
+  if (/\bwhat'?s\s+(the|my|that|this)\b.{0,40}(reminder|task|appointment|meeting|call)\b/.test(n)) return true;
+  return false;
+}
+
+/**
+ * Compound or open-ended questions need the LLM; do not short-circuit with deterministic list/detail.
+ */
+export function isCompoundReminderQuestion(message: string): boolean {
+  const m = message.trim().toLowerCase();
+  if (m.length > 180) return true;
+  if (/\b(and|but|except|unless|only if|compared to|between|versus|vs\.?|if i|what if|why|how)\b/.test(m)) {
+    return true;
+  }
+  if ((m.match(/\?/g) ?? []).length > 1) return true;
+  return false;
+}
+
+/** Rich, human-readable block for LLM context (avoid relying on raw ISO in JSON). */
+export function buildRemindersContextBlock(
+  reminders: ReminderItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string {
+  const pending = reminders.filter((r) => r.status !== "done");
+  const done = reminders.filter((r) => r.status === "done");
+  const lines: string[] = [];
+  const nowOpts = options?.timeZone ? { timeZone: options.timeZone } : undefined;
+  lines.push(`Now (user device context): ${now.toLocaleString(undefined, nowOpts)}`);
+  if (options?.timeZone) {
+    lines.push(`User time zone (IANA): ${options.timeZone}`);
+  }
+  lines.push(`Summary: ${pending.length} pending, ${done.length} completed.`);
+  lines.push(
+    `ADHOC reminders (no linked task): ${pending.filter((r) => isAdhocReminder(r)).length} pending.`
+  );
+
+  const byBucket = (label: string, bucket: ReminderBucket) => {
+    const items = pending
+      .filter((r) => getReminderBucket(r, now, options?.timeZone) === bucket)
+      .sort((a, b) => new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime());
+    if (items.length === 0) {
+      lines.push(`${label}: none`);
+      return;
+    }
+    lines.push(`${label}:`);
+    for (const r of items) {
+      lines.push(`  - ${describeReminderForChat(r, now, options)} | id=${r.id}`);
+    }
+  };
+
+  byBucket("Missed / overdue", "missed");
+  byBucket("Today", "today");
+  byBucket("Tomorrow", "tomorrow");
+  byBucket("Later (after tomorrow)", "upcoming");
+
+  if (done.length > 0) {
+    lines.push("Recently completed (sample, up to 5):");
+    for (const r of done.slice(0, 5)) {
+      lines.push(`  - ${r.title} (done) | id=${r.id}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/** Tasks digest for orchestration / LLM context (paired with reminders). */
+export function buildTasksContextBlock(
+  tasks: TaskItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string {
+  const lines: string[] = [];
+  const nowOpts = options?.timeZone ? { timeZone: options.timeZone } : undefined;
+  lines.push(`Tasks snapshot (${tasks.length} total) at ${now.toLocaleString(undefined, nowOpts)}.`);
+  if (options?.timeZone) {
+    lines.push(`User time zone (IANA): ${options.timeZone}`);
+  }
+  const pending = tasks.filter((t) => t.status !== "done");
+  const done = tasks.filter((t) => t.status === "done");
+  lines.push(`Pending: ${pending.length}, done: ${done.length}.`);
+  if (pending.length === 0 && done.length === 0) {
+    lines.push("No tasks.");
+    return lines.join("\n");
+  }
+  const fmt = (t: TaskItem) => {
+    const parts = [t.title, `id=${t.id}`];
+    if (t.domain) parts.push(`domain=${t.domain}`);
+    if (t.dueAt) {
+      parts.push(
+        `due=${new Date(t.dueAt).toLocaleString(undefined, dueTimeLocaleOptions(options))}`
+      );
+    } else parts.push("no due date");
+    parts.push(t.status);
+    return parts.join(" | ");
+  };
+  if (pending.length > 0) {
+    lines.push("Pending tasks:");
+    for (const t of pending.slice().sort((a, b) => {
+      const da = a.dueAt ? new Date(a.dueAt).getTime() : Number.MAX_SAFE_INTEGER;
+      const db = b.dueAt ? new Date(b.dueAt).getTime() : Number.MAX_SAFE_INTEGER;
+      return da - db;
+    })) {
+      lines.push(`  - ${fmt(t)}`);
+    }
+  }
+  if (done.length > 0) {
+    lines.push("Recently completed tasks (sample, up to 5):");
+    for (const t of done.slice(0, 5)) {
+      lines.push(`  - ${fmt(t)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Single block: tasks + reminders for Personal Life OS assistant. */
+export function buildLifeOsContextBlock(
+  reminders: ReminderItem[],
+  tasks: TaskItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string {
+  return [
+    "--- TASKS ---",
+    buildTasksContextBlock(tasks, now, options),
+    "",
+    "--- REMINDERS ---",
+    buildRemindersContextBlock(reminders, now, options),
+  ].join("\n");
+}
+
+function answerReminderDetailHeuristic(
+  query: string,
+  reminders: ReminderItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string | null {
+  const normalized = query.toLowerCase();
+  const activeReminders = reminders.filter((item) => item.status === "pending");
+  if (activeReminders.length === 0) return "You currently have no pending reminders.";
+
+  const scored = activeReminders
+    .map((reminder) => {
+      const title = reminder.title.toLowerCase();
+      // Exact title match → highest score
+      if (normalized.includes(title)) return { reminder, score: 100 };
+      // Token match — also try normalised tokens to handle partial spellings
+      const tokens = title.split(/\s+/).filter((token) => token.length > 2);
+      const score = tokens.reduce(
+        (sum, token) => (normalized.includes(token) ? sum + 1 : sum),
+        0
+      );
+      return { reminder, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  if (scored[0] && scored[0].score > 0) {
+    return describeReminderForChat(scored[0].reminder, now, options);
+  }
+
+  // Single pending reminder — user is probably asking about it
+  const only = activeReminders[0];
+  if (activeReminders.length === 1 && only) {
+    return describeReminderForChat(only, now, options);
+  }
+
+  // No title tokens matched and multiple reminders exist — not a reminder detail query,
+  // return null so the caller falls through to the LLM.
+  return null;
+}
+
+/**
+ * Aggressive last-resort fuzzy match: scans EVERY query (regardless of phrasing) against
+ * reminder titles. Returns a description of the best-matching reminder if there is high
+ * confidence (exact title substring, or 2+ unique meaningful tokens >= 4 chars match).
+ * Catches "what did you know about the dynamic humor", "what happen with cli update",
+ * "any updates on the gym thing" — phrasings that don't match any "tell me about" pattern.
+ *
+ * Returns null when no strong match exists, so the caller falls through to the LLM.
+ */
+export function findReminderByFuzzyMatch(
+  message: string,
+  reminders: ReminderItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string | null {
+  const normalized = message.toLowerCase();
+  const active = reminders.filter((r) => r.status === "pending");
+  if (active.length === 0) return null;
+
+  // Stop-words that appear in many titles but shouldn't trigger matches
+  const STOP = new Set([
+    "with", "from", "into", "this", "that", "have", "were", "been", "your", "they",
+    "them", "what", "when", "where", "will", "would", "could", "should", "about",
+    "task", "tasks", "reminder", "reminders", "today", "tomorrow", "every", "some",
+    "make", "take", "want", "need", "tell", "show", "give", "know", "happen", "happens",
+    "going", "doing", "back", "more", "much", "very", "just", "like", "also", "than",
+  ]);
+
+  let best: { reminder: ReminderItem; uniqueTokens: number } | null = null;
+
+  for (const reminder of active) {
+    const title = reminder.title.toLowerCase();
+
+    // Exact substring match against the full title (≥4 chars) → instant high confidence
+    if (title.length >= 4 && normalized.includes(title)) {
+      return describeReminderForChat(reminder, now, options);
+    }
+
+    // Token-level match: only meaningful tokens (>= 4 chars, not stop-words)
+    const tokens = title.split(/\s+/).filter((t) => t.length >= 4 && !STOP.has(t));
+    const seen = new Set<string>();
+    for (const token of tokens) {
+      if (!seen.has(token) && normalized.includes(token)) {
+        seen.add(token);
+      }
+    }
+    if (!best || seen.size > best.uniqueTokens) {
+      best = { reminder, uniqueTokens: seen.size };
+    }
+  }
+
+  // Require ≥2 distinct meaningful token matches — single-token matches are too noisy
+  if (best && best.uniqueTokens >= 2) {
+    return describeReminderForChat(best.reminder, now, options);
+  }
+  return null;
+}
+
+/**
+ * Query stopwords — words that must never drive a specific-reminder name match.
+ */
+const QUERY_STOPWORDS = new Set([
+  "give", "show", "tell", "list", "find", "get", "want", "need", "have", "has", "had",
+  "the", "this", "that", "these", "those", "there", "here", "what", "which", "when",
+  "where", "how", "many", "much", "any", "some", "all", "every", "about", "related",
+  "regarding", "for", "from", "with", "into", "onto", "and", "but", "reminder",
+  "reminders", "task", "tasks", "please", "me", "my", "mine", "your", "you", "do",
+  "does", "did", "are", "was", "were", "due", "date", "time", "details", "detail",
+  "info", "status", "upcoming", "overdue", "missed", "today", "tomorrow", "tonight",
+  "pending", "done", "completed", "later", "next",
+]);
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Find PENDING reminders the user is referring to by NAME — matching meaningful
+ * query words against reminder titles + notes on WORD boundaries, so "car" matches
+ * the word "car" and never "care"/"scarce". Overdue reminders are status "pending"
+ * so they're included. Returns [] when the query names nothing specific.
+ *
+ * Shared by the specific-reminder detail path and the "related to X" keyword search
+ * so the matching rules (and their precision) live in exactly one place.
+ */
+export function findRemindersByName(query: string, reminders: ReminderItem[]): ReminderItem[] {
+  const words = query
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3 && !QUERY_STOPWORDS.has(w));
+  if (words.length === 0) return [];
+  const patterns = words.map((w) => new RegExp(`\\b${escapeRegExp(w)}\\b`));
+  // Score each reminder by HOW MANY query words it contains, then keep only the
+  // strongest matches. So "doctor appointment" returns the doctor reminder (2
+  // words) and not every "…appointment" (1 word). Searches all statuses (a named
+  // reminder may be overdue/done); active (pending) shown first.
+  const scored = reminders
+    .map((r) => {
+      const hay = `${r.title} ${r.notes ?? ""}`.toLowerCase();
+      const count = patterns.reduce((c, re) => c + (re.test(hay) ? 1 : 0), 0);
+      return { r, count };
+    })
+    .filter((x) => x.count > 0);
+  if (scored.length === 0) return [];
+  const maxCount = Math.max(...scored.map((x) => x.count));
+  return scored
+    .filter((x) => x.count === maxCount)
+    .map((x) => x.r)
+    .sort((a, b) => (a.status === "pending" ? 0 : 1) - (b.status === "pending" ? 0 : 1));
+}
+
+/**
+ * Answer a "specific reminder by name" query ("give me my CLI reminder") with a
+ * detail line (one match) or a short list (several). Returns null when the query
+ * names nothing specific or is an explicit scope/topic LIST request — so callers
+ * fall through to the normal list/LLM paths. Shared by the chat route (before the
+ * generic time-bucket list) and tryGroundedReminderAnswer so the rule lives once.
+ */
+export function answerNamedReminderQuery(
+  message: string,
+  reminders: ReminderItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions,
+): string | null {
+  if (isExplicitListQuery(message)) return null;
+  const named = findRemindersByName(message, reminders);
+  if (named.length === 0) return null;
+  if (named.length === 1 && named[0]) {
+    return describeReminderForChat(named[0], now, options);
+  }
+  return [
+    `Here are the ${named.length} reminders matching that:`,
+    ...named.slice(0, 5).map((r, i) => `${i + 1}. ${describeReminderForChat(r, now, options)}`),
+  ].join("\n");
+}
+
+/**
+ * True when a message is an explicit scope/topic/bulk LIST request (not an ask
+ * about one specific reminder) — so the specific-reminder path doesn't hijack
+ * "all my reminders", "health reminders", "what's overdue", etc.
+ */
+function isExplicitListQuery(message: string): boolean {
+  const n = message.toLowerCase();
+  return (
+    /\b(all|everything|full list|every reminder)\b/.test(n) ||
+    /\b(overdue|missed|today|tonight|tomorrow|upcoming|later|pending|done|completed)\b/.test(n) ||
+    /\b(health|fitness|gym|finance|financial|money|career|work|job|hobby|hobbies|fun|study|coding|personal)\b/.test(n)
+  );
+}
+
+/**
+ * Fast grounded answers without an LLM (list + simple detail). Returns null if unclear.
+ */
+export function tryGroundedReminderAnswer(
+  message: string,
+  reminders: ReminderItem[],
+  now = new Date(),
+  options?: ReminderDisplayOptions
+): string | null {
+  const intent = classifyReminderIntent(message);
+  if (intent === "decision_query") {
+    const ranked = rankTasks(reminders, now).slice(0, 3);
+    if (ranked.length === 0) return "You have no pending reminders right now.";
+    return [
+      ranked.length === 1 ? "Your best next task is:" : "Your top next tasks are:",
+      ...ranked.map((item, idx) => `${idx + 1}. ${describeReminderForChat(item, now, options)}`),
+    ].join("\n");
+  }
+
+  if (isCompoundReminderQuestion(message) && intent !== "planning_query") return null;
+
+  // Specific-reminder query ("give me my hupendra reminder") → answer about it
+  // before the generic time-bucket list. (Also enforced earlier in the route so
+  // it isn't shadowed by inferListScopeFromMessage; kept here for the fallback path.)
+  const namedAnswer = answerNamedReminderQuery(message, reminders, now, options);
+  if (namedAnswer) return namedAnswer;
+
+  const listScope = inferListScopeFromMessage(message);
+  if (listScope) {
+    if (listScope === "today") {
+      // Pass timeZone so "today" is evaluated in the user's local calendar, not UTC
+      const today = filterToday(reminders, now, options?.timeZone).slice(0, 5);
+      if (today.length === 0) return "You have no reminders for today.";
+      return [
+        today.length === 1 ? "Here is your reminder for today:" : "Here are your reminders for today:",
+        ...today.map((r, i) => `${i + 1}. ${describeReminderForChat(r, now, options)}`),
+      ].join("\n");
+    }
+    return buildListRemindersReply(reminders, listScope, now, 5, options);
+  }
+  if (inferDetailQueryAboutReminders(message)) {
+    return answerReminderDetailHeuristic(message, reminders, now, options);
+  }
+  if (intent === "planning_query") {
+    const analysis = analyzeSchedule(reminders, now);
+    const lines: string[] = [];
+    if (analysis.nextTask) {
+      lines.push(`Start with: ${describeReminderForChat(analysis.nextTask, now, options)}`);
+    }
+    if (analysis.conflicts.length > 0) {
+      const c = analysis.conflicts[0];
+      if (c) lines.push(`Potential clash: ${c.first.title} and ${c.second.title} are ${c.minutesApart} minutes apart.`);
+    }
+    if (analysis.freeSlots.length > 0) {
+      lines.push(`Free slot: ${analysis.freeSlots[0]}`);
+    }
+    return lines.join("\n") || "You have no pending reminders to plan right now.";
+  }
+
+  // General "list reminders" intent with no specific scope/detail resolved → show
+  // all pending (oldest-due first). Catches the many natural phrasings the regex
+  // scope rules miss ("do i have any reminders", "my reminders", "what's pending",
+  // "what's on my list") instead of bouncing them to the LLM.
+  if (intent === "list_reminders") {
+    return buildListRemindersReply(reminders, "all_pending", now, 5, options);
+  }
+  return null;
+}
+
+export interface NvidiaNimProviderOptions {
+  apiKey: string;
+  model?: string;
+  baseUrl?: string;
+}
+
+const DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1";
+const DEFAULT_MODEL = "meta/llama-3.1-70b-instruct";
+
+export function createNvidiaNimChatProvider(
+  options: NvidiaNimProviderOptions
+): ReminderChatProvider {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const model = options.model ?? DEFAULT_MODEL;
+
+  return {
+    async complete(request) {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${options.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: request.model ?? model,
+          messages: request.messages,
+          temperature: request.temperature ?? 0.3,
+          max_tokens: request.maxTokens ?? 500,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`NIM request failed (${response.status}): ${errorText}`);
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (!content) {
+        throw new Error("NIM response did not include assistant content.");
+      }
+
+      return content;
+    },
+  };
+}
+
+export {
+  buildBriefingNarrative,
+  buildBriefingParts,
+  buildFollowUpQuestions,
+  replaceFollowUpSlot,
+  type BriefingMessagePart,
+  type BriefingSection,
+  type FollowUpQuestion,
+  type TaskItemBrief,
+} from "./briefing-and-followups";

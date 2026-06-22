@@ -1,0 +1,382 @@
+import type { Doc, Id } from "./_generated/dataModel";
+import type { MutationCtx } from "./_generated/server";
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+
+async function resolveShareInboxBatch(
+  ctx: MutationCtx,
+  userId: string,
+  batchKey: string
+): Promise<Doc<"reminderShareInbox">[]> {
+  if (batchKey.startsWith("legacy:")) {
+    const raw = batchKey.slice("legacy:".length);
+    const row = await ctx.db.get(raw as Id<"reminderShareInbox">);
+    if (!row || row.toUserId !== userId) return [];
+    if (row.dismissed) return [];
+    return [row];
+  }
+  const rows = await ctx.db
+    .query("reminderShareInbox")
+    .withIndex("by_to_user_batch", (q) => q.eq("toUserId", userId).eq("shareBatchId", batchKey))
+    .collect();
+  return rows.filter((r) => !r.dismissed);
+}
+
+function randomToken() {
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export const createInvite = mutation({
+  args: {
+    userId: v.string(),
+    reminderId: v.id("reminders"),
+  },
+  handler: async (ctx, args) => {
+    const reminder = await ctx.db.get(args.reminderId);
+    if (!reminder || reminder.userId !== args.userId) return null;
+
+    const existing = await ctx.db
+      .query("reminderInvites")
+      .withIndex("by_reminder", (q) => q.eq("reminderId", args.reminderId))
+      .first();
+    if (existing) return { token: existing.token, reminderId: args.reminderId };
+
+    const token = randomToken();
+    await ctx.db.insert("reminderInvites", {
+      token,
+      reminderId: args.reminderId,
+      ownerUserId: args.userId,
+      createdAt: Date.now(),
+    });
+    return { token, reminderId: args.reminderId };
+  },
+});
+
+export const getInviteByToken = query({
+  args: { token: v.string() },
+  handler: async (ctx, args) => {
+    const trimmed = args.token.trim();
+    const invites = await ctx.db
+      .query("reminderInvites")
+      .withIndex("by_token", (q) => q.eq("token", trimmed))
+      .collect();
+    const invite = invites[0];
+    if (!invite) return null;
+    const reminder = await ctx.db.get(invite.reminderId);
+    if (!reminder) return null;
+    return {
+      token: invite.token,
+      reminderId: invite.reminderId,
+      ownerUserId: invite.ownerUserId,
+      title: reminder.title,
+      dueAt: reminder.dueAt,
+      notes: reminder.notes,
+      status: reminder.status,
+    };
+  },
+});
+
+export const acceptInvite = mutation({
+  args: {
+    token: v.string(),
+    userId: v.string(),
+    displayName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const trimmed = args.token.trim();
+    const invites = await ctx.db
+      .query("reminderInvites")
+      .withIndex("by_token", (q) => q.eq("token", trimmed))
+      .collect();
+    const invite = invites[0];
+    if (!invite) return { ok: false as const, reason: "not_found" as const };
+
+    const reminder = await ctx.db.get(invite.reminderId);
+    if (!reminder) return { ok: false as const, reason: "not_found" as const };
+
+    if (reminder.userId === args.userId) {
+      return {
+        ok: false as const,
+        reason: "owner_self" as const,
+        reminderId: invite.reminderId,
+        title: reminder.title,
+      };
+    }
+
+    const existing = await ctx.db
+      .query("reminderParticipants")
+      .withIndex("by_reminder_user", (q) =>
+        q.eq("reminderId", invite.reminderId).eq("userId", args.userId)
+      )
+      .unique();
+    if (existing) {
+      return {
+        ok: true as const,
+        already: true as const,
+        reminderId: invite.reminderId,
+        ownerUserId: invite.ownerUserId,
+        title: reminder.title,
+        displayName: existing.displayName,
+      };
+    }
+
+    const name = args.displayName.trim() || "Someone";
+    await ctx.db.insert("reminderParticipants", {
+      reminderId: invite.reminderId,
+      userId: args.userId,
+      displayName: name,
+      acceptedAt: Date.now(),
+    });
+
+    return {
+      ok: true as const,
+      already: false as const,
+      reminderId: invite.reminderId,
+      ownerUserId: invite.ownerUserId,
+      title: reminder.title,
+      displayName: name,
+    };
+  },
+});
+
+export const listParticipants = query({
+  args: { reminderId: v.id("reminders"), userId: v.string() },
+  handler: async (ctx, args) => {
+    const reminder = await ctx.db.get(args.reminderId);
+    if (!reminder || reminder.userId !== args.userId) return [];
+    return await ctx.db
+      .query("reminderParticipants")
+      .withIndex("by_reminder", (q) => q.eq("reminderId", args.reminderId))
+      .collect();
+  },
+});
+
+export const shareRemindersToUsers = mutation({
+  args: {
+    userId: v.string(),
+    reminderIds: v.array(v.id("reminders")),
+    targetUserIds: v.array(v.string()),
+    fromDisplayName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const uniqueTargets = [...new Set(args.targetUserIds)].filter((id) => id && id !== args.userId);
+    if (uniqueTargets.length === 0) return { ok: true as const, delivered: 0, shareBatchId: "", perTarget: [] };
+
+    let delivered = 0;
+    const name = args.fromDisplayName.trim() || "Someone";
+    const shareBatchId = randomToken();
+    const perTarget = new Map<string, number>();
+
+    for (const reminderId of args.reminderIds) {
+      const reminder = await ctx.db.get(reminderId);
+      if (!reminder || reminder.userId !== args.userId) continue;
+
+      let token: string;
+      const existingInvite = await ctx.db
+        .query("reminderInvites")
+        .withIndex("by_reminder", (q) => q.eq("reminderId", reminderId))
+        .first();
+      if (existingInvite) {
+        token = existingInvite.token;
+      } else {
+        token = randomToken();
+        await ctx.db.insert("reminderInvites", {
+          token,
+          reminderId,
+          ownerUserId: args.userId,
+          createdAt: Date.now(),
+        });
+      }
+
+      for (const toUserId of uniqueTargets) {
+        const alreadyParticipant = await ctx.db
+          .query("reminderParticipants")
+          .withIndex("by_reminder_user", (q) =>
+            q.eq("reminderId", reminderId).eq("userId", toUserId)
+          )
+          .unique();
+        if (alreadyParticipant) continue;
+
+        const existingInbox = await ctx.db
+          .query("reminderShareInbox")
+          .withIndex("by_to_reminder", (q) =>
+            q.eq("toUserId", toUserId).eq("reminderId", reminderId)
+          )
+          .first();
+        if (existingInbox && !existingInbox.dismissed) continue;
+
+        if (existingInbox) {
+          await ctx.db.patch(existingInbox._id, {
+            token,
+            fromDisplayName: name,
+            title: reminder.title,
+            dueAt: reminder.dueAt,
+            createdAt: Date.now(),
+            dismissed: false,
+            shareBatchId,
+          });
+        } else {
+          await ctx.db.insert("reminderShareInbox", {
+            reminderId,
+            token,
+            fromUserId: args.userId,
+            fromDisplayName: name,
+            toUserId,
+            title: reminder.title,
+            dueAt: reminder.dueAt,
+            createdAt: Date.now(),
+            shareBatchId,
+          });
+        }
+        delivered += 1;
+        perTarget.set(toUserId, (perTarget.get(toUserId) ?? 0) + 1);
+      }
+    }
+    return {
+      ok: true as const,
+      delivered,
+      shareBatchId,
+      perTarget: [...perTarget.entries()].map(([userId, count]) => ({ userId, count })),
+    };
+  },
+});
+
+export const listShareInbox = query({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("reminderShareInbox")
+      .withIndex("by_to_user_created", (q) => q.eq("toUserId", args.userId))
+      .order("desc")
+      .collect();
+    return rows.filter((r) => !r.dismissed);
+  },
+});
+
+export const dismissShareInboxForReminder = mutation({
+  args: { userId: v.string(), reminderId: v.id("reminders") },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("reminderShareInbox")
+      .withIndex("by_to_reminder", (q) =>
+        q.eq("toUserId", args.userId).eq("reminderId", args.reminderId)
+      )
+      .collect();
+    for (const r of rows) {
+      await ctx.db.patch(r._id, { dismissed: true });
+    }
+    return { ok: true as const };
+  },
+});
+
+export const dismissShareInboxRow = mutation({
+  args: { userId: v.string(), inboxId: v.id("reminderShareInbox") },
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get(args.inboxId);
+    if (!row || row.toUserId !== args.userId) return null;
+    await ctx.db.patch(args.inboxId, { dismissed: true });
+    return { ok: true as const };
+  },
+});
+
+/** Accept every pending inbox row in one batch (same shareBatchId or legacy key). */
+export const acceptShareBatch = mutation({
+  args: {
+    userId: v.string(),
+    displayName: v.string(),
+    batchKey: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const name = args.displayName.trim() || "Someone";
+    const rows = await resolveShareInboxBatch(ctx, args.userId, args.batchKey);
+    if (rows.length === 0) return { ok: false as const, reason: "not_found" as const };
+
+    let acceptedNew = 0;
+    const first = rows[0]!;
+
+    for (const row of rows) {
+      const trimmed = row.token.trim();
+      const invites = await ctx.db
+        .query("reminderInvites")
+        .withIndex("by_token", (q) => q.eq("token", trimmed))
+        .collect();
+      const invite = invites[0];
+      if (!invite) continue;
+
+      const reminder = await ctx.db.get(invite.reminderId);
+      if (!reminder) continue;
+      if (reminder.userId === args.userId) continue;
+
+      const existing = await ctx.db
+        .query("reminderParticipants")
+        .withIndex("by_reminder_user", (q) =>
+          q.eq("reminderId", invite.reminderId).eq("userId", args.userId)
+        )
+        .unique();
+      if (!existing) {
+        await ctx.db.insert("reminderParticipants", {
+          reminderId: invite.reminderId,
+          userId: args.userId,
+          displayName: name,
+          acceptedAt: Date.now(),
+        });
+        acceptedNew += 1;
+      }
+    }
+
+    for (const row of rows) {
+      await ctx.db.patch(row._id, { dismissed: true });
+    }
+
+    return {
+      ok: true as const,
+      acceptedNew,
+      totalRows: rows.length,
+      fromUserId: first.fromUserId,
+      fromDisplayName: first.fromDisplayName,
+      accepterDisplayName: name,
+    };
+  },
+});
+
+export const dismissShareBatch = mutation({
+  args: { userId: v.string(), batchKey: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await resolveShareInboxBatch(ctx, args.userId, args.batchKey);
+    for (const row of rows) {
+      await ctx.db.patch(row._id, { dismissed: true });
+    }
+    return { ok: true as const, count: rows.length };
+  },
+});
+
+/** Recipients (collaborators) per owned reminder — for “Sent” filters in the UI. */
+export const listShareRecipientsForOwned = query({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    const owned = await ctx.db
+      .query("reminders")
+      .withIndex("by_user_dueAt", (q) => q.eq("userId", args.userId))
+      .collect();
+    const out: {
+      reminderId: Id<"reminders">;
+      recipients: { userId: string; displayName: string }[];
+    }[] = [];
+    for (const r of owned) {
+      const parts = await ctx.db
+        .query("reminderParticipants")
+        .withIndex("by_reminder", (q) => q.eq("reminderId", r._id))
+        .collect();
+      if (parts.length === 0) continue;
+      out.push({
+        reminderId: r._id,
+        recipients: parts.map((p) => ({ userId: p.userId, displayName: p.displayName })),
+      });
+    }
+    return out;
+  },
+});

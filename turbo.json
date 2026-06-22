@@ -1,0 +1,44 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "ui": "tui",
+  "globalEnv": [
+    "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+    "CLERK_SECRET_KEY",
+    "NVIDIA_NIM_API_KEY",
+    "NVIDIA_NIM_MODEL",
+    "CLASSIFY_WITH_LLM",
+    "CLERK_JWT_ISSUER_DOMAIN",
+    "ADMIN_CONVEX_SECRET",
+    "NIM_INPUT_COST_PER_1M_TOKENS",
+    "NIM_OUTPUT_COST_PER_1M_TOKENS",
+    "CI",
+    "E2E_BASE_URL",
+    "E2E_PORT",
+    "E2E_SIGNUP_EMAIL",
+    "E2E_SIGNUP_EMAIL_DOMAIN",
+    "E2E_SIGNUP_EMAIL_PREFIX",
+    "E2E_SIGNUP_PASSWORD",
+    "E2E_SIGNUP_VERIFICATION_CODE",
+    "E2E_TIMEZONE_ID",
+    "E2E_USER_EMAIL",
+    "E2E_USER_PASSWORD",
+    "PLAYWRIGHT_BASE_URL"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": [".next/**", "!.next/cache/**"]
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "check-types": {
+      "dependsOn": ["^check-types"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

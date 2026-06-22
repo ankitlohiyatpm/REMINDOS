@@ -1,0 +1,36 @@
+{
+  "name": "personal_life_os",
+  "private": true,
+  "scripts": {
+    "build": "turbo run build",
+    "convex:dev": "pnpm --filter @repo/db exec convex dev",
+    "convex:deploy": "pnpm --filter @repo/db exec convex deploy",
+    "dev": "turbo run dev",
+    "dev:apps": "concurrently -n web -c cyan \"pnpm --filter web dev\"",
+    "lint": "turbo run lint",
+    "predeploy:check": "pnpm test:e2e:ci",
+    "test:e2e": "pnpm --filter web test:e2e",
+    "test:e2e:headed": "pnpm --filter web test:e2e:headed",
+    "test:e2e:ci": "pnpm --filter web test:e2e:ci",
+    "format": "prettier --write \"**/*.{ts,tsx,md}\"",
+    "check-types": "turbo run check-types"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.2",
+    "concurrently": "^9.2.1",
+    "postcss": "^8.5.9",
+    "prettier": "^3.7.4",
+    "tailwindcss": "^4.2.2",
+    "turbo": "^2.9.5",
+    "typescript": "5.9.2"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "pnpm": {
+    "overrides": {
+      "csstype": "3.1.3"
+    }
+  }
+}
